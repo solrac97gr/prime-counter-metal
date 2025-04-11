@@ -14,94 +14,87 @@ func countPrimesWithMetalAccurate(range: UInt32) {
 
     // Define a more accurate Metal shader
     let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
+            #include <metal_stdlib>
+            using namespace metal;
 
-        // Simple bit operations for bit-packed sieve
-        inline bool getBit(device const uint* sieve, uint index) {
-            return (sieve[index / 32] & (1 << (index % 32))) != 0;
-        }
-
-        inline void clearBit(device uint* sieve, uint index) {
-            atomic_fetch_and_explicit(
-                (device atomic_uint*)(sieve + (index / 32)),
-                ~(1 << (index % 32)),
-                memory_order_relaxed
-            );
-        }
-
-        // Initialize the sieve
-        kernel void initSieve(
-            device uint* sieve [[buffer(0)]],
-            constant uint& range [[buffer(1)]],
-            uint id [[thread_position_in_grid]],
-            uint threads [[threads_per_grid]])
-        {
-            uint elementsPerThread = ((range / 32) + threads - 1) / threads;
-            uint start = id * elementsPerThread;
-            uint end = min(start + elementsPerThread, (range / 32) + 1);
-
-            // Initialize all bits to 1 (prime)
-            for (uint i = start; i < end; i++) {
-                sieve[i] = 0xFFFFFFFF;
+            // Simple bit operations for bit-packed sieve
+            inline bool getBit(device const uint* sieve, uint index) {
+                return (sieve[index / 32] & (1u << (index % 32))) != 0;
             }
 
-            // Ensure thread 0 marks 0 and 1 as non-prime
-            if (id == 0) {
-                sieve[0] &= ~(1u << 0); // 0 is not prime
-                sieve[0] &= ~(1u << 1); // 1 is not prime
+            inline void clearBit(device uint* sieve, uint index) {
+                atomic_fetch_and_explicit(
+                    (device atomic_uint*)(sieve + (index / 32)),
+                    ~(1u << (index % 32)),
+                    memory_order_relaxed
+                );
             }
-        }
 
-        // Mark multiples as non-prime
-        kernel void markMultiples(
-            device uint* sieve [[buffer(0)]],
-            constant uint& range [[buffer(1)]],
-            uint id [[thread_position_in_grid]],
-            uint threads [[threads_per_grid]])
-        {
-            // Skip thread IDs 0 and 1
-            if (id <= 1) return;
-
-            // Only process if this ID is still marked prime
-            uint blockIdx = id / 32;
-            uint bitIdx = id % 32;
-
-            bool isPrime = (sieve[blockIdx] & (1 << bitIdx)) != 0;
-            uint sqrtRange = uint(sqrt(float(range)));
-
-            // Only threads representing prime numbers <= sqrt(range) mark multiples
-            if (isPrime && id <= sqrtRange) {
-                // Start from id*id and mark all multiples as non-prime
-                for (uint j = id * id; j <= range; j += id) {
-                    clearBit(sieve, j);
+            // Initialize the sieve
+            kernel void initSieve(
+                device uint* sieve [[buffer(0)]],
+                constant uint& range [[buffer(1)]],
+                uint id [[thread_position_in_grid]])
+            {
+                // Fill with 1s (all assumed prime initially)
+                if (id < (range / 32 + 1)) {
+                    sieve[id] = 0xFFFFFFFF;
                 }
-            }
-        }
 
-        // Count the primes in the sieve
-        kernel void countPrimes(
-            device const uint* sieve [[buffer(0)]],
-            constant uint& range [[buffer(1)]],
-            device atomic_uint* totalCount [[buffer(2)]],
-            uint id [[thread_position_in_grid]],
-            uint threads [[threads_per_grid]])
-        {
-            // Each thread counts primes in its own chunk
-            uint numbersPerThread = (range + threads - 1) / threads;
-            uint start = id * numbersPerThread;
-            uint end = min(start + numbersPerThread, range + 1);
-
-            uint localCount = 0;
-            for (uint i = start; i < end; i++) {
-                if (getBit(sieve, i)) {
-                    localCount++;
+                // Mark 0 and 1 as non-prime
+                if (id == 0) {
+                    sieve[0] &= ~(1u); // Clear bit 0
+                    sieve[0] &= ~(2u); // Clear bit 1
                 }
             }
 
-            // Add local count to global count
-            atomic_fetch_add_explicit(totalCount, localCount, memory_order_relaxed);
-        }
+            // Mark multiples as non-prime using Sieve of Eratosthenes
+            kernel void markMultiples(
+                device uint* sieve [[buffer(0)]],
+                constant uint& range [[buffer(1)]],
+                uint id [[thread_position_in_grid]],
+                uint threads [[threads_per_grid]])
+            {
+                // Each thread processes a chunk of starting primes
+                uint sqrtRange = uint(sqrt(float(range)));
+                uint primesPerThread = (sqrtRange + threads - 1) / threads;
+                uint startPrime = 2 + id * primesPerThread;
+                uint endPrime = min(startPrime + primesPerThread, sqrtRange + 1);
+
+                for (uint p = startPrime; p < endPrime; p++) {
+                    // Check if p is still marked as prime
+                    if (getBit(sieve, p)) {
+                        // Mark all multiples of p (starting from p*p) as non-prime
+                        for (uint multiple = p * p; multiple <= range; multiple += p) {
+                            clearBit(sieve, multiple);
+                        }
+                    }
+                }
+            }
+
+            // Count the primes in the sieve
+            kernel void countPrimes(
+                device const uint* sieve [[buffer(0)]],
+                constant uint& range [[buffer(1)]],
+                device atomic_uint* totalCount [[buffer(2)]],
+                uint id [[thread_position_in_grid]],
+                uint threads [[threads_per_grid]])
+            {
+                // Each thread counts primes in its own chunk
+                uint numbersPerThread = (range + threads - 1) / threads;
+                uint start = id * numbersPerThread;
+                uint end = min(start + numbersPerThread, range + 1);
+
+                uint localCount = 0;
+                for (uint i = start; i < end; i++) {
+                    if (getBit(sieve, i)) {
+                        localCount++;
+                    }
+                }
+
+                // Add local count to global count
+                atomic_fetch_add_explicit(totalCount, localCount, memory_order_relaxed);
+            }
         """
 
     let library: MTLLibrary
@@ -136,11 +129,13 @@ func countPrimesWithMetalAccurate(range: UInt32) {
     initEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
     initEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
 
-    // Dispatch with optimal thread count for initialization
-    let initThreads = min(initPipeline.maxTotalThreadsPerThreadgroup, sieveSize)
-    initEncoder.dispatchThreads(
-        MTLSize(width: initThreads, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: initThreads, height: 1, depth: 1)
+    // Dispatch enough threads to initialize the entire sieve
+    let threadgroupSize = min(initPipeline.maxTotalThreadsPerThreadgroup, 256)
+    let threadgroups = (sieveSize + threadgroupSize - 1) / threadgroupSize
+
+    initEncoder.dispatchThreadgroups(
+        MTLSize(width: threadgroups, height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
     )
     initEncoder.endEncoding()
     initCommandBuffer.commit()
@@ -156,11 +151,9 @@ func countPrimesWithMetalAccurate(range: UInt32) {
     markEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
     markEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
 
-    // Use enough threads to cover all potential primes up to range
-    // Each thread ID is a potential prime number
-    let sqrtRange = Int(sqrt(Float(range)))
-    let markThreads = min(markPipeline.maxTotalThreadsPerThreadgroup, sqrtRange + 1)
-    let markThreadgroups = (sqrtRange + markThreads) / markThreads
+    // Use a moderate number of threads for good parallelism
+    let markThreads = min(markPipeline.maxTotalThreadsPerThreadgroup, 256)
+    let markThreadgroups = 64  // Use enough threads to efficiently distribute work
 
     markEncoder.dispatchThreadgroups(
         MTLSize(width: markThreadgroups, height: 1, depth: 1),
@@ -219,5 +212,5 @@ func countPrimesWithMetalAccurate(range: UInt32) {
 }
 
 // Execute both implementations
-let range: UInt32 = 100_000_000  // 100 million
+let range: UInt32 = 1_000_000_000
 countPrimesWithMetalAccurate(range: range)
