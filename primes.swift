@@ -1,107 +1,105 @@
 import Foundation
 import Metal
 
-// Function to count primes using Metal
-func countPrimesWithMetal(range: UInt32) {
-    print("Counting primes from 0 to \(range) using Metal...")
+func countPrimesWithMetalAccurate(range: UInt32) {
+    print("Counting primes from 0 to \(range) using accurate Metal GPU implementation...")
     let startTime = CFAbsoluteTimeGetCurrent()
 
-    // Create the Metal device
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        fatalError("Metal is not supported on this device")
+    // Create the Metal device and command queue
+    guard let device = MTLCreateSystemDefaultDevice(),
+        let commandQueue = device.makeCommandQueue()
+    else {
+        fatalError("Metal setup failed")
     }
 
-    // Create a command queue
-    guard let commandQueue = device.makeCommandQueue() else {
-        fatalError("Could not create command queue")
-    }
-
-    // Load the Metal shader library
+    // Define a more accurate Metal shader
     let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
 
-        // For boolean array in a bit-packed format
-        // Each integer stores 32 boolean values
-        kernel void primeSieve(
-            device uint* sieve [[buffer(0)]],      // Bit array for the sieve
-            constant uint& range [[buffer(1)]],    // The maximum number to check
+        // Simple bit operations for bit-packed sieve
+        inline bool getBit(device const uint* sieve, uint index) {
+            return (sieve[index / 32] & (1 << (index % 32))) != 0;
+        }
+
+        inline void clearBit(device uint* sieve, uint index) {
+            atomic_fetch_and_explicit(
+                (device atomic_uint*)(sieve + (index / 32)),
+                ~(1 << (index % 32)),
+                memory_order_relaxed
+            );
+        }
+
+        // Initialize the sieve
+        kernel void initSieve(
+            device uint* sieve [[buffer(0)]],
+            constant uint& range [[buffer(1)]],
             uint id [[thread_position_in_grid]],
             uint threads [[threads_per_grid]])
         {
-            // Each thread handles a subset of potential prime numbers
-            // Start from 2 (first prime) and skip 0 and 1
+            uint elementsPerThread = ((range / 32) + threads - 1) / threads;
+            uint start = id * elementsPerThread;
+            uint end = min(start + elementsPerThread, (range / 32) + 1);
 
-            // Calculate the chunk size for each thread
-            uint sqrtRange = sqrt(float(range));
-
-            // First pass: find primes up to sqrt(range)
-            if (id == 0) {
-                // Initialize all to prime (1)
-                for (uint i = 0; i < (range / 32) + 1; i++) {
-                    sieve[i] = 0xFFFFFFFF; // All bits set to 1 (prime)
-                }
-
-                // 0 and 1 are not prime
-                sieve[0] &= ~(1 << 0);  // Clear bit 0
-                sieve[0] &= ~(1 << 1);  // Clear bit 1
-
-                // Sieve of Eratosthenes algorithm (sequential for sqrt part)
-                for (uint i = 2; i <= sqrtRange; i++) {
-                    // If i is prime
-                    if (sieve[i / 32] & (1 << (i % 32))) {
-                        // Mark all multiples of i as non-prime
-                        for (uint j = i * i; j <= range; j += i) {
-                            sieve[j / 32] &= ~(1 << (j % 32));
-                        }
-                    }
-                }
+            // Initialize all bits to 1 (prime)
+            for (uint i = start; i < end; i++) {
+                sieve[i] = 0xFFFFFFFF;
             }
 
-            // Synchronize threads to ensure first pass is complete
-            threadgroup_barrier(mem_flags::mem_device);
+            // Ensure thread 0 marks 0 and 1 as non-prime
+            if (id == 0) {
+                sieve[0] &= ~(1u << 0); // 0 is not prime
+                sieve[0] &= ~(1u << 1); // 1 is not prime
+            }
+        }
 
-            // Second pass: Parallelize the sieving for numbers > sqrt(range)
-            // Divide the remaining work across threads
-            uint threadsNeeded = sqrtRange - 1; // Number of primes ≤ sqrt(range)
-            if (id <= threadsNeeded && id >= 2) { // Skip non-prime threads 0,1
-                if (sieve[id / 32] & (1 << (id % 32))) { // If this thread ID is a prime number
-                    // Mark multiples as non-prime, starting from id*id
-                    for (uint j = id * id; j <= range; j += id) {
-                        // Atomic operation to prevent race conditions
-                        atomic_fetch_and_explicit(
-                            (device atomic_uint*)(sieve + (j / 32)),
-                            ~(1 << (j % 32)),
-                            memory_order_relaxed
-                        );
-                    }
+        // Mark multiples as non-prime
+        kernel void markMultiples(
+            device uint* sieve [[buffer(0)]],
+            constant uint& range [[buffer(1)]],
+            uint id [[thread_position_in_grid]],
+            uint threads [[threads_per_grid]])
+        {
+            // Skip thread IDs 0 and 1
+            if (id <= 1) return;
+
+            // Only process if this ID is still marked prime
+            uint blockIdx = id / 32;
+            uint bitIdx = id % 32;
+
+            bool isPrime = (sieve[blockIdx] & (1 << bitIdx)) != 0;
+            uint sqrtRange = uint(sqrt(float(range)));
+
+            // Only threads representing prime numbers <= sqrt(range) mark multiples
+            if (isPrime && id <= sqrtRange) {
+                // Start from id*id and mark all multiples as non-prime
+                for (uint j = id * id; j <= range; j += id) {
+                    clearBit(sieve, j);
                 }
             }
         }
 
-        // Kernel to count prime numbers identified by the sieve
+        // Count the primes in the sieve
         kernel void countPrimes(
-            device const uint* sieve [[buffer(0)]],   // Bit array with the sieve results
-            constant uint& range [[buffer(1)]],       // The maximum number to check
-            device atomic_uint* totalCount [[buffer(2)]],  // For storing the total count
+            device const uint* sieve [[buffer(0)]],
+            constant uint& range [[buffer(1)]],
+            device atomic_uint* totalCount [[buffer(2)]],
             uint id [[thread_position_in_grid]],
             uint threads [[threads_per_grid]])
         {
-            // Determine chunk size per thread
+            // Each thread counts primes in its own chunk
             uint numbersPerThread = (range + threads - 1) / threads;
             uint start = id * numbersPerThread;
             uint end = min(start + numbersPerThread, range + 1);
 
-            // Count primes in this thread's range
             uint localCount = 0;
-
             for (uint i = start; i < end; i++) {
-                if (sieve[i / 32] & (1 << (i % 32))) {
+                if (getBit(sieve, i)) {
                     localCount++;
                 }
             }
 
-            // Add this thread's count to the global count
+            // Add local count to global count
             atomic_fetch_add_explicit(totalCount, localCount, memory_order_relaxed);
         }
         """
@@ -113,31 +111,7 @@ func countPrimesWithMetal(range: UInt32) {
         fatalError("Failed to create Metal library: \(error)")
     }
 
-    // Create the compute pipeline for the prime sieve
-    guard let sieveFunction = library.makeFunction(name: "primeSieve") else {
-        fatalError("Failed to find primeSieve kernel function")
-    }
-
-    let sievePipelineState: MTLComputePipelineState
-    do {
-        sievePipelineState = try device.makeComputePipelineState(function: sieveFunction)
-    } catch {
-        fatalError("Failed to create sieve compute pipeline state: \(error)")
-    }
-
-    // Create the compute pipeline for counting primes
-    guard let countFunction = library.makeFunction(name: "countPrimes") else {
-        fatalError("Failed to find countPrimes kernel function")
-    }
-
-    let countPipelineState: MTLComputePipelineState
-    do {
-        countPipelineState = try device.makeComputePipelineState(function: countFunction)
-    } catch {
-        fatalError("Failed to create count compute pipeline state: \(error)")
-    }
-
-    // Calculate buffer size for sieve (bit-packed, so 32 numbers per uint)
+    // Calculate buffer size (bit-packed: 32 numbers per uint)
     let sieveSize = (Int(range) / 32) + 1
     let sieveBufferSize = sieveSize * MemoryLayout<UInt32>.size
 
@@ -148,64 +122,76 @@ func countPrimesWithMetal(range: UInt32) {
     let countBuffer = device.makeBuffer(
         length: MemoryLayout<UInt32>.size, options: .storageModeShared)!
 
-    // Initialize count to 0
+    // Zero out the count
     let countPtr = countBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
     countPtr.pointee = 0
 
-    // Create a command buffer
-    guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-        fatalError("Could not create command buffer")
-    }
+    // STEP 1: Initialize the sieve
+    let initFunction = library.makeFunction(name: "initSieve")!
+    let initPipeline = try! device.makeComputePipelineState(function: initFunction)
 
-    // Create a compute command encoder for the sieve
-    guard let sieveEncoder = commandBuffer.makeComputeCommandEncoder() else {
-        fatalError("Could not create compute command encoder")
-    }
+    let initCommandBuffer = commandQueue.makeCommandBuffer()!
+    let initEncoder = initCommandBuffer.makeComputeCommandEncoder()!
+    initEncoder.setComputePipelineState(initPipeline)
+    initEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
+    initEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
 
-    // Configure the sieve encoder
-    sieveEncoder.setComputePipelineState(sievePipelineState)
-    sieveEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
-    sieveEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
-
-    // Calculate grid and threadgroup sizes
-    let sqrtRange = UInt32(sqrt(Float(range)))
-    let threadExecutionWidth = sievePipelineState.threadExecutionWidth
-    let threadsPerGrid = Int(max(sqrtRange + 1, 64))  // Convert to Int
-    let threadsPerThreadgroup = min(threadExecutionWidth, threadsPerGrid)  // Now both are Int
-
-    sieveEncoder.dispatchThreads(
-        MTLSize(width: threadsPerGrid, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: threadsPerThreadgroup, height: 1, depth: 1)
+    // Dispatch with optimal thread count for initialization
+    let initThreads = min(initPipeline.maxTotalThreadsPerThreadgroup, sieveSize)
+    initEncoder.dispatchThreads(
+        MTLSize(width: initThreads, height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: initThreads, height: 1, depth: 1)
     )
+    initEncoder.endEncoding()
+    initCommandBuffer.commit()
+    initCommandBuffer.waitUntilCompleted()
 
-    sieveEncoder.endEncoding()
+    // STEP 2: Mark multiples
+    let markFunction = library.makeFunction(name: "markMultiples")!
+    let markPipeline = try! device.makeComputePipelineState(function: markFunction)
 
-    // Create a compute command encoder for counting
-    guard let countEncoder = commandBuffer.makeComputeCommandEncoder() else {
-        fatalError("Could not create compute command encoder for counting")
-    }
+    let markCommandBuffer = commandQueue.makeCommandBuffer()!
+    let markEncoder = markCommandBuffer.makeComputeCommandEncoder()!
+    markEncoder.setComputePipelineState(markPipeline)
+    markEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
+    markEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
 
-    // Configure the count encoder
-    countEncoder.setComputePipelineState(countPipelineState)
+    // Use enough threads to cover all potential primes up to range
+    // Each thread ID is a potential prime number
+    let sqrtRange = Int(sqrt(Float(range)))
+    let markThreads = min(markPipeline.maxTotalThreadsPerThreadgroup, sqrtRange + 1)
+    let markThreadgroups = (sqrtRange + markThreads) / markThreads
+
+    markEncoder.dispatchThreadgroups(
+        MTLSize(width: markThreadgroups, height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: markThreads, height: 1, depth: 1)
+    )
+    markEncoder.endEncoding()
+    markCommandBuffer.commit()
+    markCommandBuffer.waitUntilCompleted()
+
+    // STEP 3: Count the primes
+    let countFunction = library.makeFunction(name: "countPrimes")!
+    let countPipeline = try! device.makeComputePipelineState(function: countFunction)
+
+    let countCommandBuffer = commandQueue.makeCommandBuffer()!
+    let countEncoder = countCommandBuffer.makeComputeCommandEncoder()!
+    countEncoder.setComputePipelineState(countPipeline)
     countEncoder.setBuffer(sieveBuffer, offset: 0, index: 0)
     countEncoder.setBuffer(rangeBuffer, offset: 0, index: 1)
     countEncoder.setBuffer(countBuffer, offset: 0, index: 2)
 
-    // The counting can be parallelized more effectively
-    let countThreadsPerGrid = min(1024, Int(range) + 1)  // Convert to Int
-    let countThreadsPerThreadgroup = min(
-        countPipelineState.threadExecutionWidth, countThreadsPerGrid)
+    // Use optimal thread count for counting
+    let countThreads = min(countPipeline.maxTotalThreadsPerThreadgroup, 512)
+    let countThreadgroups = 64  // Use more threads for better parallelism during counting
 
-    countEncoder.dispatchThreads(
-        MTLSize(width: countThreadsPerGrid, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: countThreadsPerThreadgroup, height: 1, depth: 1)
+    countEncoder.dispatchThreadgroups(
+        MTLSize(width: countThreadgroups, height: 1, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: countThreads, height: 1, depth: 1)
     )
-
     countEncoder.endEncoding()
-
-    // Commit the command buffer and wait for it to complete
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
+    countCommandBuffer.commit()
+    countCommandBuffer.waitUntilCompleted()
 
     // Read the result
     let primeCount = countPtr.pointee
@@ -213,9 +199,11 @@ func countPrimesWithMetal(range: UInt32) {
     let endTime = CFAbsoluteTimeGetCurrent()
     let timeElapsed = endTime - startTime
 
-    print("Found \(primeCount) prime numbers in \(timeElapsed) seconds")
+    print(
+        "Found \(primeCount) prime numbers in \(timeElapsed) seconds using accurate GPU implementation"
+    )
 
-    // For verification on small ranges, you can extract and print the primes
+    // Verify small range results if needed
     if range < 1000 {
         var primes: [UInt32] = []
         let sievePtr = sieveBuffer.contents().bindMemory(to: UInt32.self, capacity: sieveSize)
@@ -226,42 +214,10 @@ func countPrimesWithMetal(range: UInt32) {
             }
         }
 
-        print("Primes: \(primes)")
+        print("First few primes: \(primes.prefix(20))...")
     }
 }
 
-// For comparison: CPU implementation
-func countPrimesSequential(range: UInt32) {
-    print("Counting primes from 0 to \(range) using CPU...")
-    let startTime = CFAbsoluteTimeGetCurrent()
-
-    // Create the sieve array
-    var sieve = [Bool](repeating: true, count: Int(range) + 1)
-    sieve[0] = false
-    sieve[1] = false
-
-    // Apply the Sieve of Eratosthenes
-    let sqrtRange = UInt32(sqrt(Float(range)))
-    for i in 2...sqrtRange {
-        if sieve[Int(i)] {
-            var j = i * i
-            while j <= range {
-                sieve[Int(j)] = false
-                j += i
-            }
-        }
-    }
-
-    // Count the primes
-    let primeCount = sieve.filter { $0 }.count
-
-    let endTime = CFAbsoluteTimeGetCurrent()
-    let timeElapsed = endTime - startTime
-
-    print("Found \(primeCount) prime numbers in \(timeElapsed) seconds")
-}
-
-// Execute both implementations for comparison
-let range: UInt32 = 10_000_000  // Adjust as needed, using a smaller value for testing
-countPrimesSequential(range: range)
-countPrimesWithMetal(range: range)
+// Execute both implementations
+let range: UInt32 = 100_000_000  // 100 million
+countPrimesWithMetalAccurate(range: range)
